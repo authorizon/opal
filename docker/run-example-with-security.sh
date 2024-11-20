@@ -45,7 +45,7 @@ then
 fi
 
 echo "running OPAL server so we can sign on JWT tokens..."
-OPAL_REPO_WATCHER_ENABLED=0 opal-server run &
+OPAL_AUTH_JWT_AUDIENCE=https://api.opal.ac/v1/ OPAL_AUTH_JWT_ISSUER=https://opal.ac/ OPAL_REPO_WATCHER_ENABLED=0 opal-server run &
 
 sleep 2;
 
@@ -61,7 +61,7 @@ echo "Saving your config to .env file..."
 rm -f .env
 echo "OPAL_AUTH_PUBLIC_KEY=\"$OPAL_AUTH_PUBLIC_KEY\"" >> .env
 echo "OPAL_AUTH_PRIVATE_KEY=\"$OPAL_AUTH_PRIVATE_KEY\"" >> .env
-echo "ACALLA_MASTER_TOKEN=\"$ACALLA_MASTER_TOKEN\"" >> .env
+echo "OPAL_AUTH_MASTER_TOKEN=\"$OPAL_AUTH_MASTER_TOKEN\"" >> .env
 echo "OPAL_CLIENT_TOKEN=\"$OPAL_CLIENT_TOKEN\"" >> .env
 echo "OPAL_AUTH_PRIVATE_KEY_PASSPHRASE=\"$OPAL_AUTH_PRIVATE_KEY_PASSPHRASE\"" >> .env
 

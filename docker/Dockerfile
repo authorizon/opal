@@ -1,59 +1,70 @@
 # BUILD STAGE ---------------------------------------
 # split this stage to save time and reduce image size
 # ---------------------------------------------------
-# NOTE: at the moment we use alpine3.11 instead of alpine latest
-# due to https://github.com/gliderlabs/docker-alpine/issues/539
-# which broke alpine dns lookup methods starting at alpine 3.12.
-FROM python:3.8-alpine3.11 as BuildStage
-# update apk cache
-RUN apk update
-# TODO: remove this when upgrading to a new alpine version
-# more details: https://github.com/pyca/cryptography/issues/5771
-ENV CRYPTOGRAPHY_DONT_BUILD_RUST=1
-# install linux libraries necessary to compile some python packages
-RUN apk add --update --no-cache --virtual .build-deps gcc git build-base alpine-sdk python3-dev musl-dev postgresql-dev libffi-dev libressl-dev
+FROM python:3.10-bookworm AS build-stage
 # from now on, work in the /app directory
 WORKDIR /app/
 # Layer dependency install (for caching)
-COPY requirements.txt requirements.txt
+COPY ./packages/requires.txt ./base_requires.txt
+COPY ./packages/opal-common/requires.txt ./common_requires.txt
+COPY ./packages/opal-client/requires.txt ./client_requires.txt
+COPY ./packages/opal-server/requires.txt ./server_requires.txt
 # install python deps
-RUN pip install --no-cache-dir --upgrade pip && pip install --no-cache-dir --user -r requirements.txt
+RUN pip install --no-cache-dir --upgrade pip && pip install --no-cache-dir -r ./base_requires.txt -r ./common_requires.txt -r ./client_requires.txt -r ./server_requires.txt
 
+# CEDAR AGENT BUILD STAGE ---------------------------
+# split this stage to save time and reduce image size
+# ---------------------------------------------------
+FROM rust:1.79 AS cedar-builder
+COPY ./cedar-agent /tmp/cedar-agent
+WORKDIR /tmp/cedar-agent
+RUN CARGO_REGISTRIES_CRATES_IO_PROTOCOL=sparse cargo build --release
 
 # COMMON IMAGE --------------------------------------
 # ---------------------------------------------------
-# NOTE: at the moment we use alpine3.11 instead of alpine latest
-# due to https://github.com/gliderlabs/docker-alpine/issues/539
-# which broke alpine dns lookup methods starting at alpine 3.12.
-FROM python:3.8-alpine3.11 as common
-# copy libraries from build stage
-COPY --from=BuildStage /root/.local /root/.local
-# needed for rookout
-RUN apk add g++ python3-dev linux-headers
-# copy wait-for script
-COPY scripts/wait-for.sh /usr/wait-for.sh
-RUN chmod +x /usr/wait-for.sh
-# copy startup script
-COPY ./scripts/start.sh /start.sh
-RUN chmod +x /start.sh
+FROM python:3.10-slim-bookworm AS common
+
+# copy libraries from build stage (This won't copy redundant libraries we used in build-stage)
+# also remove the default python site-packages that has older versions of packages that won't be overridden
+RUN rm -r /usr/local/lib/python3.10/site-packages
+COPY --from=build-stage /usr/local /usr/local
+
+# Add non-root user (with home dir at /opal)
+RUN useradd -m -b / -s /bin/bash opal
+WORKDIR /opal
+
+# copy wait-for script (create link at old path to maintain backward compatibility)
+COPY scripts/wait-for.sh .
+RUN chmod +x ./wait-for.sh
+RUN ln -s /opal/wait-for.sh /usr/wait-for.sh
+
+# netcat (nc) is used by the wait-for.sh script
+RUN apt-get update && apt-get install -y netcat-traditional jq wget && apt-get clean
+
+# copy startup script (create link at old path to maintain backward compatibility)
+COPY ./scripts/start.sh .
+RUN chmod +x ./start.sh
+RUN ln -s /opal/start.sh /start.sh
 # copy gunicorn_config
-COPY ./scripts/gunicorn_conf.py /gunicorn_conf.py
+COPY ./scripts/gunicorn_conf.py .
 # copy app code
-COPY . ./
-# install sidecar package
-RUN python setup/setup_common.py install
+
+COPY ./README.md .
+COPY ./packages ./packages/
+# install the opal-common package
+RUN cd ./packages/opal-common && python setup.py install
 # Make sure scripts in .local are usable:
-ENV PATH=/:/root/.local/bin:$PATH
+ENV PATH=/opal:/root/.local/bin:$PATH
 # run gunicorn
-CMD ["/start.sh"]
+CMD ["./start.sh"]
 
 
 # STANDALONE IMAGE ----------------------------------
 # ---------------------------------------------------
-FROM common as client-standalone
-# install sidecar client package
-RUN python setup/setup_client.py install
+FROM common AS client-standalone
 # uvicorn config ------------------------------------
+# install the opal-client package
+RUN cd ./packages/opal-client && python setup.py install
 
 # WARNING: do not change the number of workers on the opal client!
 # only one worker is currently supported for the client.
@@ -69,27 +80,76 @@ ENV OPAL_INLINE_OPA_ENABLED=false
 
 # expose opal client port
 EXPOSE 7000
+USER opal
+
+RUN mkdir -p /opal/backup
+VOLUME /opal/backup
 
 
-# CLIENT IMAGE --------------------------------------
+# IMAGE to extract OPA from official image ----------
+# ---------------------------------------------------
+FROM alpine:latest AS opa-extractor
+USER root
+
+RUN apk update && apk add skopeo tar
+WORKDIR /opal
+
+# copy opa from official docker image
+ARG opa_image=openpolicyagent/opa
+ARG opa_tag=latest-static
+RUN skopeo copy "docker://${opa_image}:${opa_tag}" docker-archive:./image.tar && \
+  mkdir image && tar xf image.tar -C ./image && cat image/*.tar | tar xf - -C ./image -i && \
+  find image/ -name "opa*" -type f -executable -print0 | xargs -0 -I "{}" cp {} ./opa && chmod 755 ./opa && \
+  rm -r image image.tar
+
+
+# OPA CLIENT IMAGE ----------------------------------
 # Using standalone image as base --------------------
 # ---------------------------------------------------
-FROM client-standalone as client
-# curl is needed for next section
-RUN apk add --update --no-cache curl
-# copy opa from official image (main binary and lib for web assembly)
-RUN curl -L -o /opa https://openpolicyagent.org/downloads/latest/opa_linux_amd64_static && chmod 755 /opa
+FROM client-standalone AS client
+
+# Temporarily move back to root for additional setup
+USER root
+
+# copy opa from opa-extractor
+COPY --from=opa-extractor /opal/opa ./opa
+
 # enable inline OPA
 ENV OPAL_INLINE_OPA_ENABLED=true
+ENV OPAL_INLINE_OPA_EXEC_PATH=/opal/opa
 # expose opa port
 EXPOSE 8181
+USER opal
 
+# CEDAR CLIENT IMAGE --------------------------------
+# Using standalone image as base --------------------
+# ---------------------------------------------------
+FROM client-standalone AS client-cedar
+
+# Temporarily move back to root for additional setup
+USER root
+
+# Copy cedar from its build stage
+COPY --from=cedar-builder /tmp/cedar-agent/target/*/cedar-agent /bin/cedar-agent
+
+# enable inline Cedar agent
+ENV OPAL_POLICY_STORE_TYPE=CEDAR
+ENV OPAL_INLINE_CEDAR_ENABLED=true
+ENV OPAL_INLINE_CEDAR_EXEC_PATH=/bin/cedar-agent
+ENV OPAL_INLINE_CEDAR_CONFIG='{"addr": "0.0.0.0:8180"}'
+ENV OPAL_POLICY_STORE_URL=http://localhost:8180
+# expose cedar port
+EXPOSE 8180
+USER opal
 
 # SERVER IMAGE --------------------------------------
 # ---------------------------------------------------
-FROM common as server
-# git is needed by opal server (for policy repo tracking)
-RUN apk add --update --no-cache git openssh
+FROM common AS server
+
+RUN apt-get update && apt-get install -y openssh-client git && apt-get clean
+RUN git config --global core.symlinks false # Mitigate CVE-2024-32002
+
+USER opal
 
 # Potentially trust POLICY REPO HOST ssh signature --
 # opal trackes a remote (git) repository and fetches policy (e.g rego) from it.
@@ -107,13 +167,15 @@ RUN apk add --update --no-cache git openssh
 ARG TRUST_POLICY_REPO_HOST_SSH_FINGERPRINT="true"
 ARG POLICY_REPO_HOST="github.com"
 
-RUN if [[ "$TRUST_POLICY_REPO_HOST_SSH_FINGERPRINT" == "true" ]] ; then \
-    mkdir -p /root/.ssh && \
-    chmod 0700 /root/.ssh && \
-    ssh-keyscan -t rsa ${POLICY_REPO_HOST} >> /root/.ssh/known_hosts ; fi
+RUN if [ "$TRUST_POLICY_REPO_HOST_SSH_FINGERPRINT" = "true" ] ; then \
+  mkdir -p ~/.ssh && \
+  chmod 0700 ~/.ssh && \
+  ssh-keyscan -t rsa ${POLICY_REPO_HOST} >> ~/.ssh/known_hosts ; fi
 
-# install sidecar server package
-RUN python setup/setup_server.py install
+USER root
+
+# install the opal-server package
+RUN cd ./packages/opal-server && python setup.py install
 
 # uvicorn config ------------------------------------
 
@@ -132,6 +194,10 @@ ENV UVICORN_PORT=7002
 # `host.docker.internal` value will work better than `localhost` if you are
 # running dockerized opal server and client on the same machine
 ENV OPAL_ALL_DATA_URL=http://host.docker.internal:7002/policy-data
+# Use fixed path for the policy repo - so new leader would use the same directory without re-cloning it.
+# That's ok when running in docker and fs is ephemeral (repo in a bad state would be fixed by restarting container).
+ENV OPAL_POLICY_REPO_REUSE_CLONE_PATH=true
 
 # expose opal server port
 EXPOSE 7002
+USER opal

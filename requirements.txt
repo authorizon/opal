@@ -1,23 +1,11 @@
-idna<3,>=2.5
-typer
-aiofiles
-aiohttp
-broadcaster[postgres]
-colorama
-fastapi==0.65.2
-fastapi_websocket_pubsub>=0.1.21
-fastapi_websocket_rpc>=0.1.21
-GitPython
-gunicorn
-ipython
-loguru==0.5.3
-psutil==5.8.0
-pydantic[email]
-pyjwt[crypto]==2.1.0
-python-decouple
-tenacity==6.3.1
-typing-extensions
-uvicorn[standard]
-websockets==9.1
-rook
-ddtrace
+-e ./packages/opal-common
+-e ./packages/opal-client
+-e ./packages/opal-server
+ipython>=8.10.0
+pytest
+pytest-asyncio
+pytest-rerunfailures
+wheel>=0.38.0
+twine
+setuptools>=70.0.0 # not directly required, pinned by Snyk to avoid a vulnerability
+zipp>=3.19.1 # not directly required, pinned by Snyk to avoid a vulnerability
